@@ -1,20 +1,24 @@
 /**
- * Belle Bakes – weekly order limits for the Pre-Order Google Form.
+ * Belle Bakes – weekly order limits and pickup days for the Pre-Order Google Form.
  *
  * What it does
- *   - After every order, adds up this week's loaves and cookie bundles.
- *   - Trims each question's choices so nobody can order more than is left
- *     (e.g. only "1 bundle" and "2 bundles" when 2 are left).
- *   - When an item is gone, its only choice becomes "Sold out this week".
- *   - When everything is gone, closes the form with a friendly sold-out message.
+ *   - Bakes are split by day: each item has its own Thursday and Friday limit.
+ *   - Adds a required "When would you like to pick up?" question (Thursday / Friday).
+ *   - After every order, decides the pickup day. A whole order goes to one day:
+ *     it gets the day the customer chose if everything in it still fits that day's batch;
+ *     otherwise it moves to the other day, the customer gets an email, and the order
+ *     Sheet's "Confirmed pickup" column says so.
+ *   - Trims the quantity choices so nobody can pick more than one day's batch has left,
+ *     hides a pickup day once it's fully booked, and closes the form when everything is gone.
  *   - Every Saturday morning it starts a new week: all choices come back and the form reopens.
  *
- * Setup (once): in the form editor, ⋮ → Apps Script, paste this file, save,
- * choose "setup" in the toolbar and press Run, then approve the permissions.
+ * Setup (once): in the form editor, ⋮ → Apps Script, paste this file and save.
+ * Ideally Annabelle then runs "setup" from her own Google account (toolbar → choose setup → Run),
+ * so emails to customers come from her and the script runs under her account.
  *
  * Handy functions to run by hand from the toolbar:
  *   resetWeek()   – start a new week right now
- *   checkStatus() – see this week's counts (shown in the Execution log)
+ *   checkStatus() – see this week's counts by day (shown in the Execution log)
  *   saveChoices() – after editing the quantity choices in the form (e.g. adding "5 loaves"),
  *                   run this so the script remembers the new full list
  */
@@ -23,11 +27,23 @@
 
 // Question titles must match the form exactly. The number in each choice
 // ("2 loaves", "3 bundles (12 cookies)") is what gets counted.
-const LIMITS = [
-  { title: 'Sourdough?', limit: 8, unit: 'loaves' },
-  { title: 'How many cookies would you like?', limit: 15, unit: 'cookie bundles' },
+const ITEMS = [
+  { title: 'Sourdough?', unit: 'loaves', perDay: { Thursday: 4, Friday: 4 } },
+  { title: 'How many cookies would you like?', unit: 'cookie bundles', perDay: { Thursday: 7, Friday: 8 } },
 ];
 
+const PICKUP = {
+  title: 'When would you like to pick up?',
+  days: ['Thursday', 'Friday'],
+  help: 'We bake half of each item for Thursday and half for Friday. If your whole order can’t be ready Thursday, ' +
+        'we’ll move it to Friday and email you.',
+};
+
+const NAME_TITLE = 'Name (first & last)';
+const EMAIL_TITLE = 'Email';
+const PICKUP_COLUMN = 'Confirmed pickup';   // added to the order Sheet
+
+const SHOP_NAME = 'Belle Bakes';
 const SOLD_OUT_CHOICE = 'Sold out this week';
 const CLOSED_MESSAGE = 'We’re sold out this week! Thank you so much ♡ Check back soon for next week’s bakes.';
 
@@ -35,8 +51,8 @@ const CLOSED_MESSAGE = 'We’re sold out this week! Thank you so much ♡ Check 
 const RESET_DAY = ScriptApp.WeekDay.SATURDAY;
 const RESET_HOUR = 9;   // 9am, in the form owner's time zone
 
-// Who gets a heads-up email if two orders land at once and an item goes over its limit.
-// Leave blank to use the Google account that ran setup().
+// Gets a heads-up if two orders land at once and a day goes over its limit; also the reply-to
+// address on customer emails. Leave blank to use the Google account that ran setup().
 const ALERT_EMAIL = '';
 
 // ---------- Setup and weekly reset ----------
@@ -44,12 +60,13 @@ const ALERT_EMAIL = '';
 function setup() {
   const form = FormApp.getActiveForm();
   const props = PropertiesService.getScriptProperties();
+  ensurePickupQuestion_(form);
 
   // Remember the full list of choices the first time, so they can come back each week.
   if (!props.getProperty('originals')) {
     const originals = {};
-    for (const cfg of LIMITS) {
-      originals[cfg.title] = choiceValues_(findItem_(form, cfg.title)).filter(v => v !== SOLD_OUT_CHOICE);
+    for (const title of ITEMS.map(i => i.title).concat(PICKUP.title)) {
+      originals[title] = choiceValues_(findItem_(form, title)).filter(v => v !== SOLD_OUT_CHOICE);
     }
     props.setProperty('originals', JSON.stringify(originals));
   }
@@ -60,7 +77,7 @@ function setup() {
   ScriptApp.newTrigger('onOrder').forForm(form).onFormSubmit().create();
   ScriptApp.newTrigger('resetWeek').timeBased().onWeekDay(RESET_DAY).atHour(RESET_HOUR).create();
 
-  Logger.log(updateForm_().summary.join('\n'));
+  Logger.log(updateForm_(form, weekState_(form).used).join('\n'));
 }
 
 function saveChoices() {
@@ -69,71 +86,195 @@ function saveChoices() {
 }
 
 function resetWeek() {
-  PropertiesService.getScriptProperties().setProperty('weekStart', String(Date.now()));
-  Logger.log(updateForm_().summary.join('\n'));   // restores every choice and reopens the form
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('weekStart', String(Date.now()));
+  props.deleteProperty('assigned');
+  const form = FormApp.getActiveForm();
+  Logger.log(updateForm_(form, weekState_(form).used).join('\n'));   // restores every choice, reopens the form
 }
 
 function checkStatus() {
   const form = FormApp.getActiveForm();
-  const used = usedThisWeek_(form);
-  for (const cfg of LIMITS) {
-    Logger.log(`${cfg.title}  ${used[cfg.title]} of ${cfg.limit} ${cfg.unit} ordered this week`);
+  const { used } = weekState_(form);
+  for (const day of PICKUP.days) {
+    for (const item of ITEMS) {
+      Logger.log(`${day}  ${item.title}  ${used[day][item.title]} of ${item.perDay[day]} ${item.unit}`);
+    }
   }
   Logger.log(`Form is ${form.isAcceptingResponses() ? 'open' : 'closed'}.`);
 }
 
 // ---------- Runs after every order ----------
 
-function onOrder(e) {
+function onOrder() {
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
-    const { used } = updateForm_();
-    const over = LIMITS.filter(cfg => used[cfg.title] > cfg.limit);
-    if (over.length) alertOversold_(over, used, e);
+    const form = FormApp.getActiveForm();
+    const { used, fresh } = weekState_(form);
+    for (const { response, order, day } of fresh) {
+      try { recordPickup_(form, response, order, day); } catch (err) { Logger.log('Sheet: ' + err); }
+      if (order.preferred && day !== order.preferred) emailMoved_(order, day);
+    }
+    const over = [];
+    for (const day of PICKUP.days) {
+      for (const item of ITEMS) {
+        if (used[day][item.title] > item.perDay[day]) over.push(`• ${day} ${item.title}: ${used[day][item.title]} ordered, limit ${item.perDay[day]} ${item.unit}`);
+      }
+    }
+    if (over.length) alertOversold_(over, fresh);
+    updateForm_(form, used);
   } finally {
     lock.releaseLock();
   }
 }
 
-// ---------- Helpers ----------
+// ---------- Deciding pickup days ----------
 
-function updateForm_() {
-  const form = FormApp.getActiveForm();
-  const originals = JSON.parse(PropertiesService.getScriptProperties().getProperty('originals') || '{}');
-  const used = usedThisWeek_(form);
-  const summary = [];
-  let anyLeft = false;
+// Walks this week's orders in the order they arrived. Orders already given a day keep it;
+// new ones get a day now. Returns what's used per day, plus the newly assigned orders.
+function weekState_(form) {
+  const props = PropertiesService.getScriptProperties();
+  const assigned = JSON.parse(props.getProperty('assigned') || '{}');
+  const since = new Date(Number(props.getProperty('weekStart') || 0));
+  const used = {};
+  PICKUP.days.forEach(day => { used[day] = {}; ITEMS.forEach(i => { used[day][i.title] = 0; }); });
 
-  for (const cfg of LIMITS) {
-    const left = Math.max(0, cfg.limit - used[cfg.title]);
-    const fits = (originals[cfg.title] || []).filter(v => quantity_(v) <= left);
-    setChoices_(findItem_(form, cfg.title), fits.length ? fits : [SOLD_OUT_CHOICE]);
-    if (fits.length) anyLeft = true;
-    summary.push(`${cfg.title}  ${left} of ${cfg.limit} ${cfg.unit} left`);
+  const fresh = [];
+  const responses = form.getResponses(since).sort((a, b) => a.getTimestamp() - b.getTimestamp());
+  for (const response of responses) {
+    const order = readOrder_(response);
+    let day = assigned[response.getId()];
+    if (!day) {
+      day = chooseDay_(order, used);
+      assigned[response.getId()] = day;
+      fresh.push({ response, order, day });
+    }
+    ITEMS.forEach(i => { used[day][i.title] += order.qty[i.title]; });
   }
+  props.setProperty('assigned', JSON.stringify(assigned));
+  return { used, fresh };
+}
+
+function fits_(order, used, day) {
+  return ITEMS.every(i => used[day][i.title] + order.qty[i.title] <= i.perDay[day]);
+}
+
+// The chosen day if the whole order fits; otherwise the other day if it fits there.
+// If neither fits (two orders at once), it stays on the chosen day and Annabelle gets an email.
+function chooseDay_(order, used) {
+  const preferred = PICKUP.days.includes(order.preferred) ? order.preferred : PICKUP.days[PICKUP.days.length - 1];
+  if (fits_(order, used, preferred)) return preferred;
+  return PICKUP.days.find(d => d !== preferred && fits_(order, used, d)) || preferred;
+}
+
+function readOrder_(response) {
+  const order = { qty: {}, preferred: '', name: '', email: '', summary: [] };
+  ITEMS.forEach(i => { order.qty[i.title] = 0; });
+  for (const answer of response.getItemResponses()) {
+    const title = answer.getItem().getTitle().trim();
+    const values = [].concat(answer.getResponse());
+    order.summary.push(`${title}: ${values.join(', ')}`);
+    if (title in order.qty) order.qty[title] = values.reduce((sum, v) => sum + quantity_(v), 0);
+    else if (title === PICKUP.title) order.preferred = String(values[0]);
+    else if (title === NAME_TITLE) order.name = String(values[0]).trim();
+    else if (title === EMAIL_TITLE) order.email = String(values[0]).trim();
+  }
+  return order;
+}
+
+// ---------- Updating the form ----------
+
+function updateForm_(form, used) {
+  const originals = JSON.parse(PropertiesService.getScriptProperties().getProperty('originals') || '{}');
+  const summary = [];
+
+  // A single order goes to one day, so it can't be bigger than the most any one day has left.
+  for (const item of ITEMS) {
+    const left = PICKUP.days.map(d => Math.max(0, item.perDay[d] - used[d][item.title]));
+    const fits = (originals[item.title] || []).filter(v => quantity_(v) <= Math.max(...left));
+    setChoices_(findItem_(form, item.title), fits.length ? fits : [SOLD_OUT_CHOICE]);
+    PICKUP.days.forEach((d, n) => summary.push(`${d}  ${item.title}  ${left[n]} of ${item.perDay[d]} ${item.unit} left`));
+  }
+
+  // Offer only the days that still have something left.
+  const open = (originals[PICKUP.title] || PICKUP.days)
+    .filter(d => ITEMS.some(i => i.perDay[d] !== undefined && used[d][i.title] < i.perDay[d]));
+  if (open.length) setChoices_(findItem_(form, PICKUP.title), open);
 
   form.setCustomClosedFormMessage(CLOSED_MESSAGE);
-  form.setAcceptingResponses(anyLeft);
-  summary.push(`Form is ${anyLeft ? 'open' : 'closed (sold out)'}.`);
-  return { used, anyLeft, summary };
+  form.setAcceptingResponses(open.length > 0);
+  summary.push(`Form is ${open.length ? 'open' : 'closed (sold out)'}.`);
+  return summary;
 }
 
-// Adds up quantities from every response since the week started.
-function usedThisWeek_(form) {
-  const since = new Date(Number(PropertiesService.getScriptProperties().getProperty('weekStart') || 0));
-  const used = {};
-  LIMITS.forEach(cfg => { used[cfg.title] = 0; });
-  for (const response of form.getResponses(since)) {
-    for (const answer of response.getItemResponses()) {
-      const title = answer.getItem().getTitle();
-      if (title in used) {
-        used[title] += [].concat(answer.getResponse()).reduce((sum, v) => sum + quantity_(v), 0);
-      }
-    }
-  }
-  return used;
+function ensurePickupQuestion_(form) {
+  if (form.getItems().some(i => i.getTitle().trim() === PICKUP.title)) return;
+  const question = form.addMultipleChoiceItem()
+    .setTitle(PICKUP.title)
+    .setHelpText(PICKUP.help)
+    .setChoiceValues(PICKUP.days)
+    .setRequired(true);
+  // Place it right after the last quantity question.
+  const after = Math.max(...ITEMS.map(i => findItem_(form, i.title).getIndex()));
+  form.moveItem(question.getIndex(), after + 1);
 }
+
+// ---------- Order Sheet and emails ----------
+
+// Writes the confirmed day next to the order in the linked response Sheet, if there is one.
+function recordPickup_(form, response, order, day) {
+  if (form.getDestinationType() !== FormApp.DestinationType.SPREADSHEET) return;
+  const book = SpreadsheetApp.openById(form.getDestinationId());
+  const sheet = book.getSheets().find(s => s.getFormUrl()) || book.getSheets()[0];
+  const note = day + (order.preferred && day !== order.preferred ? ` (moved from ${order.preferred})` : '');
+  const when = response.getTimestamp().getTime();
+
+  for (let attempt = 0; attempt < 3; attempt++) {   // the new row can take a moment to appear
+    const width = Math.max(sheet.getLastColumn(), 1);
+    const header = sheet.getRange(1, 1, 1, width).getValues()[0].map(String);
+    let col = header.indexOf(PICKUP_COLUMN) + 1;
+    if (!col) { col = width + 1; sheet.getRange(1, col).setValue(PICKUP_COLUMN); }
+    const emailCol = header.indexOf(EMAIL_TITLE);
+    const rows = sheet.getLastRow() > 1 ? sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues() : [];
+    for (let r = rows.length - 1; r >= 0; r--) {
+      const stamp = rows[r][0];
+      const sameTime = stamp instanceof Date && Math.abs(stamp.getTime() - when) < 3000;
+      const sameEmail = emailCol < 0 || String(rows[r][emailCol]).trim().toLowerCase() === order.email.toLowerCase();
+      if (sameTime && sameEmail) { sheet.getRange(r + 2, col).setValue(note); return; }
+    }
+    Utilities.sleep(2000);
+  }
+}
+
+function emailMoved_(order, day) {
+  if (!/@/.test(order.email)) return;
+  const first = (order.name.split(/\s+/)[0] || 'there');
+  const options = {
+    to: order.email,
+    name: SHOP_NAME,
+    subject: `Your ${SHOP_NAME} order will be ready ${day}`,
+    body:
+      `Hi ${first},\n\n` +
+      `Thank you so much for your order! Our ${order.preferred} batch is all spoken for, ` +
+      `so your whole order will be ready for pickup on ${day} instead.\n\n` +
+      `If ${day} doesn’t work for you, just reply to this email and we’ll sort it out.\n\n` +
+      `${SHOP_NAME} ♡`,
+  };
+  if (ALERT_EMAIL) options.replyTo = ALERT_EMAIL;
+  MailApp.sendEmail(options);
+}
+
+function alertOversold_(lines, fresh) {
+  const to = ALERT_EMAIL || Session.getEffectiveUser().getEmail();
+  const latest = fresh.length ? fresh[fresh.length - 1].order.summary : [];
+  MailApp.sendEmail(to, `${SHOP_NAME}: an order went over a day’s limit`,
+    'Two orders came in at almost the same time, so a day is slightly oversold:\n\n' +
+    lines.join('\n') + '\n\nThe latest order was:\n' + latest.join('\n') +
+    '\n\nYou may want to reach out to them. The form has already been updated.');
+}
+
+// ---------- Small helpers ----------
 
 // "3 bundles (12 cookies)" → 3, "Sold out this week" → 0
 function quantity_(text) {
@@ -143,7 +284,7 @@ function quantity_(text) {
 
 function findItem_(form, title) {
   const item = form.getItems().find(i => i.getTitle().trim() === title);
-  if (!item) throw new Error(`Couldn't find the question "${title}". Check LIMITS at the top of the script.`);
+  if (!item) throw new Error(`Couldn't find the question "${title}". Check the settings at the top of the script.`);
   return item;
 }
 
@@ -152,8 +293,7 @@ function choiceValues_(item) {
 }
 
 function setChoices_(item, values) {
-  const current = choiceValues_(item);
-  if (current.join('\n') !== values.join('\n')) typed_(item).setChoiceValues(values);
+  if (choiceValues_(item).join('\n') !== values.join('\n')) typed_(item).setChoiceValues(values);
 }
 
 function typed_(item) {
@@ -163,16 +303,4 @@ function typed_(item) {
     case FormApp.ItemType.CHECKBOX: return item.asCheckboxItem();
     default: throw new Error(`"${item.getTitle()}" needs to be a multiple choice, dropdown, or checkbox question.`);
   }
-}
-
-function alertOversold_(over, used, e) {
-  const to = ALERT_EMAIL || Session.getEffectiveUser().getEmail();
-  const lines = over.map(cfg => `• ${cfg.title}: ${used[cfg.title]} ordered, limit ${cfg.limit} ${cfg.unit}`);
-  const order = e && e.response
-    ? e.response.getItemResponses().map(a => `${a.getItem().getTitle()}: ${[].concat(a.getResponse()).join(', ')}`)
-    : [];
-  MailApp.sendEmail(to, 'Belle Bakes: an order went over this week’s limit',
-    'Two orders came in at almost the same time, so this week is slightly oversold:\n\n' +
-    lines.join('\n') + '\n\nThe latest order was:\n' + order.join('\n') +
-    '\n\nYou may want to reach out to them. The form has already been updated.');
 }
