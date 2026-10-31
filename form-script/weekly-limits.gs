@@ -10,7 +10,7 @@
  *     Sheet's "Confirmed pickup" column says so.
  *   - Trims the quantity choices so nobody can pick more than one day's batch has left,
  *     hides a pickup day once it's fully booked, and closes the form when everything is gone.
- *   - Thursday pickup stops taking orders Wednesday at 8pm, Friday pickup Thursday at 8pm.
+ *   - Orders for both pickup days close Wednesday at 8pm.
  *   - Every Friday at 8pm it starts a new week: all choices come back and the form reopens.
  *
  * Setup (once): paste this file into an Apps Script project (script.google.com, or ⋮ → Apps Script in the form) and save.
@@ -41,8 +41,8 @@ const ITEMS = [
 const PICKUP = {
   title: 'When would you like to pick up?',
   days: ['Thursday', 'Friday'],
-  help: 'We bake half of each item for Thursday and half for Friday. Thursday pickup orders close Wednesday at 8pm, ' +
-        'and Friday pickup orders close Thursday at 8pm. If your whole order can’t be ready Thursday, ' +
+  help: 'We bake half of each item for Thursday and half for Friday. Orders for both days close Wednesday at 8pm. ' +
+        'If your whole order can’t be ready Thursday, ' +
         'we’ll move it to Friday and email you.',
 };
 
@@ -63,7 +63,7 @@ const SCHEDULE = {
   opens: { day: 'FRIDAY', hour: 20 },                 // Friday 8pm: next week's orders open
   cutoffs: {
     Thursday: { day: 'WEDNESDAY', hour: 20 },         // Thursday pickup closes Wednesday 8pm
-    Friday: { day: 'THURSDAY', hour: 20 },            // Friday pickup closes Thursday 8pm
+    Friday: { day: 'WEDNESDAY', hour: 20 },           // Friday pickup also closes Wednesday 8pm
   },
 };
 
@@ -93,8 +93,11 @@ function setup() {
   ScriptApp.newTrigger('onOrder').forForm(form).onFormSubmit().create();
   ScriptApp.newTrigger('resetWeek').timeBased()
     .onWeekDay(ScriptApp.WeekDay[SCHEDULE.opens.day]).atHour(SCHEDULE.opens.hour).create();
-  for (const cut of Object.values(SCHEDULE.cutoffs)) {
-    ScriptApp.newTrigger('refresh').timeBased().onWeekDay(ScriptApp.WeekDay[cut.day]).atHour(cut.hour).create();
+  // One refresh per distinct cutoff time (both days can share Wednesday 8pm).
+  const cutoffTimes = new Set(Object.values(SCHEDULE.cutoffs).map(cut => `${cut.day} ${cut.hour}`));
+  for (const time of cutoffTimes) {
+    const [day, hour] = time.split(' ');
+    ScriptApp.newTrigger('refresh').timeBased().onWeekDay(ScriptApp.WeekDay[day]).atHour(Number(hour)).create();
   }
 
   Logger.log(updateForm_(form, weekState_(form).used).join('\n'));
@@ -152,6 +155,8 @@ function onOrder() {
       }
     }
     if (over.length) alertOversold_(over, fresh);
+    // Orders that slipped in after Wednesday's cutoff, before the form had closed
+    if (PICKUP.days.every(isClosed_)) fresh.forEach(f => alertLate_(f.order));
     updateForm_(form, used);
   } finally {
     lock.releaseLock();
@@ -314,6 +319,13 @@ function alertOversold_(lines, fresh) {
     '\n\nYou may want to reach out to them. The form has already been updated.');
 }
 
+function alertLate_(order) {
+  const to = ALERT_EMAIL || Session.getEffectiveUser().getEmail();
+  MailApp.sendEmail(to, `${SHOP_NAME}: an order came in after this week’s cutoff`,
+    'This order arrived just after orders closed, before the form finished closing:\n\n' +
+    order.summary.join('\n') + '\n\nYou may want to let them know whether you can fit it in.');
+}
+
 // ---------- Weekly schedule ----------
 
 function isClosed_(day) {
@@ -321,15 +333,19 @@ function isClosed_(day) {
   return Boolean(cut) && Date.now() >= cut.getTime();
 }
 
-// This week's cutoff times: each is the first one after the week opened, in pickup-day order.
+// This week's cutoff times: each is the first one after the week opened. A later pickup day's
+// cutoff is never earlier than an earlier day's (matters only if the week is reset mid-week).
 function cutoffs_() {
-  let after = Number(PropertiesService.getScriptProperties().getProperty('weekStart') || Date.now());
+  const start = Number(PropertiesService.getScriptProperties().getProperty('weekStart') || Date.now());
   const result = {};
+  let previous = start;
   for (const day of PICKUP.days) {
     const cut = SCHEDULE.cutoffs[day];
     if (!cut) continue;
-    result[day] = nextWeekdayAt_(after, cut.day, cut.hour);
-    after = result[day].getTime();
+    let when = nextWeekdayAt_(start, cut.day, cut.hour);
+    if (when.getTime() < previous) when = nextWeekdayAt_(previous, cut.day, cut.hour);
+    result[day] = when;
+    previous = when.getTime();
   }
   return result;
 }
