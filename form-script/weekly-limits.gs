@@ -12,7 +12,7 @@
  *     hides a pickup day once it's fully booked, and closes the form when everything is gone.
  *   - Every Saturday morning it starts a new week: all choices come back and the form reopens.
  *
- * Setup (once): in the form editor, ⋮ → Apps Script, paste this file and save.
+ * Setup (once): paste this file into an Apps Script project (script.google.com, or ⋮ → Apps Script in the form) and save.
  * Ideally Annabelle then runs "setup" from her own Google account (toolbar → choose setup → Run),
  * so emails to customers come from her and the script runs under her account.
  *
@@ -24,6 +24,11 @@
  */
 
 // ---------- Settings ----------
+
+// The Pre-Order Form's ID (from its edit link: docs.google.com/forms/d/<ID>/edit).
+// Lets this script live as its own Apps Script project. Leave blank if the script
+// was added from inside the form (⋮ → Apps Script).
+const FORM_ID = '1nszT6Q0ebBJlTx-gVUr2F9am2Ho5lT0yN5F6GVj_log';
 
 // Question titles must match the form exactly. The number in each choice
 // ("2 loaves", "3 bundles (12 cookies)") is what gets counted.
@@ -58,7 +63,7 @@ const ALERT_EMAIL = '';
 // ---------- Setup and weekly reset ----------
 
 function setup() {
-  const form = FormApp.getActiveForm();
+  const form = form_();
   const props = PropertiesService.getScriptProperties();
   ensurePickupQuestion_(form);
 
@@ -89,12 +94,12 @@ function resetWeek() {
   const props = PropertiesService.getScriptProperties();
   props.setProperty('weekStart', String(Date.now()));
   props.deleteProperty('assigned');
-  const form = FormApp.getActiveForm();
+  const form = form_();
   Logger.log(updateForm_(form, weekState_(form).used).join('\n'));   // restores every choice, reopens the form
 }
 
 function checkStatus() {
-  const form = FormApp.getActiveForm();
+  const form = form_();
   const { used } = weekState_(form);
   for (const day of PICKUP.days) {
     for (const item of ITEMS) {
@@ -110,7 +115,7 @@ function onOrder() {
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
-    const form = FormApp.getActiveForm();
+    const form = form_();
     const { used, fresh } = weekState_(form);
     for (const { response, order, day } of fresh) {
       try { recordPickup_(form, response, order, day); } catch (err) { Logger.log('Sheet: ' + err); }
@@ -303,4 +308,8 @@ function typed_(item) {
     case FormApp.ItemType.CHECKBOX: return item.asCheckboxItem();
     default: throw new Error(`"${item.getTitle()}" needs to be a multiple choice, dropdown, or checkbox question.`);
   }
+}
+
+function form_() {
+  return FORM_ID ? FormApp.openById(FORM_ID) : FormApp.getActiveForm();
 }
