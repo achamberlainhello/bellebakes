@@ -10,7 +10,8 @@
  *     Sheet's "Confirmed pickup" column says so.
  *   - Trims the quantity choices so nobody can pick more than one day's batch has left,
  *     hides a pickup day once it's fully booked, and closes the form when everything is gone.
- *   - Every Saturday morning it starts a new week: all choices come back and the form reopens.
+ *   - Thursday pickup stops taking orders Wednesday at 8pm, Friday pickup Thursday at 8pm.
+ *   - Every Friday at 8pm it starts a new week: all choices come back and the form reopens.
  *
  * Setup (once): paste this file into an Apps Script project (script.google.com, or ⋮ → Apps Script in the form) and save.
  * Ideally Annabelle then runs "setup" from her own Google account (toolbar → choose setup → Run),
@@ -40,21 +41,31 @@ const ITEMS = [
 const PICKUP = {
   title: 'When would you like to pick up?',
   days: ['Thursday', 'Friday'],
-  help: 'We bake half of each item for Thursday and half for Friday. If your whole order can’t be ready Thursday, ' +
+  help: 'We bake half of each item for Thursday and half for Friday. Thursday pickup orders close Wednesday at 8pm, ' +
+        'and Friday pickup orders close Thursday at 8pm. If your whole order can’t be ready Thursday, ' +
         'we’ll move it to Friday and email you.',
 };
 
 const NAME_TITLE = 'Name (first & last)';
 const EMAIL_TITLE = 'Email';
 const PICKUP_COLUMN = 'Confirmed pickup';   // added to the order Sheet
+const WEEK_COLUMN = 'Week';                 // e.g. "Week of Nov 5", for filtering the Sheet
 
 const SHOP_NAME = 'Belle Bakes';
 const SOLD_OUT_CHOICE = 'Sold out this week';
 const CLOSED_MESSAGE = 'We’re sold out this week! Thank you so much ♡ Check back soon for next week’s bakes.';
 
-// When the new week starts (orders reopen).
-const RESET_DAY = ScriptApp.WeekDay.SATURDAY;
-const RESET_HOUR = 9;   // 9am, in the form owner's time zone
+const CLOSED_FOR_WEEK_MESSAGE = 'Orders for this week are closed. New orders open Friday at 8pm ♡';
+
+// Weekly schedule, in the script's time zone (Project Settings → Time zone).
+// Each pickup day stops taking orders at its cutoff; a new week opens Friday evening.
+const SCHEDULE = {
+  opens: { day: 'FRIDAY', hour: 20 },                 // Friday 8pm: next week's orders open
+  cutoffs: {
+    Thursday: { day: 'WEDNESDAY', hour: 20 },         // Thursday pickup closes Wednesday 8pm
+    Friday: { day: 'THURSDAY', hour: 20 },            // Friday pickup closes Thursday 8pm
+  },
+};
 
 // Gets a heads-up if two orders land at once and a day goes over its limit; also the reply-to
 // address on customer emails. Leave blank to use the Google account that ran setup().
@@ -80,7 +91,11 @@ function setup() {
   // Replace any earlier triggers from this script, then add the two it needs.
   ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger('onOrder').forForm(form).onFormSubmit().create();
-  ScriptApp.newTrigger('resetWeek').timeBased().onWeekDay(RESET_DAY).atHour(RESET_HOUR).create();
+  ScriptApp.newTrigger('resetWeek').timeBased()
+    .onWeekDay(ScriptApp.WeekDay[SCHEDULE.opens.day]).atHour(SCHEDULE.opens.hour).create();
+  for (const cut of Object.values(SCHEDULE.cutoffs)) {
+    ScriptApp.newTrigger('refresh').timeBased().onWeekDay(ScriptApp.WeekDay[cut.day]).atHour(cut.hour).create();
+  }
 
   Logger.log(updateForm_(form, weekState_(form).used).join('\n'));
 }
@@ -98,6 +113,12 @@ function resetWeek() {
   Logger.log(updateForm_(form, weekState_(form).used).join('\n'));   // restores every choice, reopens the form
 }
 
+// Runs at each cutoff so a pickup day comes off the form on time.
+function refresh() {
+  const form = form_();
+  Logger.log(updateForm_(form, weekState_(form).used).join('\n'));
+}
+
 function checkStatus() {
   const form = form_();
   const { used } = weekState_(form);
@@ -105,6 +126,9 @@ function checkStatus() {
     for (const item of ITEMS) {
       Logger.log(`${day}  ${item.title}  ${used[day][item.title]} of ${item.perDay[day]} ${item.unit}`);
     }
+  }
+  for (const [day, when] of Object.entries(cutoffs_())) {
+    Logger.log(`${day} pickup orders close ${when}`);
   }
   Logger.log(`Form is ${form.isAcceptingResponses() ? 'open' : 'closed'}.`);
 }
@@ -165,12 +189,15 @@ function fits_(order, used, day) {
   return ITEMS.every(i => used[day][i.title] + order.qty[i.title] <= i.perDay[day]);
 }
 
-// The chosen day if the whole order fits; otherwise the other day if it fits there.
-// If neither fits (two orders at once), it stays on the chosen day and Annabelle gets an email.
+// The chosen day if it's still taking orders and the whole order fits; otherwise another open
+// day where it fits. If nothing fits (two orders at once), it stays put and Annabelle gets an email.
 function chooseDay_(order, used) {
-  const preferred = PICKUP.days.includes(order.preferred) ? order.preferred : PICKUP.days[PICKUP.days.length - 1];
+  const openDays = PICKUP.days.filter(d => !isClosed_(d));
+  const preferred = openDays.includes(order.preferred)
+    ? order.preferred
+    : openDays[openDays.length - 1] || order.preferred || PICKUP.days[PICKUP.days.length - 1];
   if (fits_(order, used, preferred)) return preferred;
-  return PICKUP.days.find(d => d !== preferred && fits_(order, used, d)) || preferred;
+  return openDays.find(d => d !== preferred && fits_(order, used, d)) || preferred;
 }
 
 function readOrder_(response) {
@@ -194,27 +221,29 @@ function updateForm_(form, used) {
   const originals = JSON.parse(PropertiesService.getScriptProperties().getProperty('originals') || '{}');
   const summary = [];
 
-  // A single order goes to one day, so it can't be bigger than the most any one day has left.
+  // A single order goes to one day, so it can't be bigger than the most any open day has left.
   for (const item of ITEMS) {
-    const left = PICKUP.days.map(d => Math.max(0, item.perDay[d] - used[d][item.title]));
+    const left = PICKUP.days.map(d => isClosed_(d) ? 0 : Math.max(0, item.perDay[d] - used[d][item.title]));
     const fits = (originals[item.title] || []).filter(v => quantity_(v) <= Math.max(...left));
     setChoices_(findItem_(form, item.title), fits.length ? fits : [SOLD_OUT_CHOICE]);
     PICKUP.days.forEach((d, n) => summary.push(`${d}  ${item.title}  ${left[n]} of ${item.perDay[d]} ${item.unit} left`));
   }
 
-  // Offer only the days that still have something left.
+  // Offer only the days that are still taking orders and have something left.
+  const stillOpen = PICKUP.days.filter(d => !isClosed_(d));
   const open = (originals[PICKUP.title] || PICKUP.days)
-    .filter(d => ITEMS.some(i => i.perDay[d] !== undefined && used[d][i.title] < i.perDay[d]));
+    .filter(d => stillOpen.includes(d) && ITEMS.some(i => i.perDay[d] !== undefined && used[d][i.title] < i.perDay[d]));
   if (open.length) setChoices_(findItem_(form, PICKUP.title), open);
 
-  form.setCustomClosedFormMessage(CLOSED_MESSAGE);
+  form.setCustomClosedFormMessage(stillOpen.length ? CLOSED_MESSAGE : CLOSED_FOR_WEEK_MESSAGE);
   form.setAcceptingResponses(open.length > 0);
-  summary.push(`Form is ${open.length ? 'open' : 'closed (sold out)'}.`);
+  summary.push(`Form is ${open.length ? 'open' : stillOpen.length ? 'closed (sold out)' : 'closed until the new week opens'}.`);
   return summary;
 }
 
 function ensurePickupQuestion_(form) {
-  if (form.getItems().some(i => i.getTitle().trim() === PICKUP.title)) return;
+  const existing = form.getItems().find(i => i.getTitle().trim() === PICKUP.title);
+  if (existing) { existing.setHelpText(PICKUP.help); return; }
   const question = form.addMultipleChoiceItem()
     .setTitle(PICKUP.title)
     .setHelpText(PICKUP.help)
@@ -240,13 +269,19 @@ function recordPickup_(form, response, order, day) {
     const header = sheet.getRange(1, 1, 1, width).getValues()[0].map(String);
     let col = header.indexOf(PICKUP_COLUMN) + 1;
     if (!col) { col = width + 1; sheet.getRange(1, col).setValue(PICKUP_COLUMN); }
+    let weekCol = header.indexOf(WEEK_COLUMN) + 1;
+    if (!weekCol) { weekCol = Math.max(width, col) + 1; sheet.getRange(1, weekCol).setValue(WEEK_COLUMN); }
     const emailCol = header.indexOf(EMAIL_TITLE);
     const rows = sheet.getLastRow() > 1 ? sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues() : [];
     for (let r = rows.length - 1; r >= 0; r--) {
       const stamp = rows[r][0];
       const sameTime = stamp instanceof Date && Math.abs(stamp.getTime() - when) < 3000;
       const sameEmail = emailCol < 0 || String(rows[r][emailCol]).trim().toLowerCase() === order.email.toLowerCase();
-      if (sameTime && sameEmail) { sheet.getRange(r + 2, col).setValue(note); return; }
+      if (sameTime && sameEmail) {
+        sheet.getRange(r + 2, col).setValue(note);
+        sheet.getRange(r + 2, weekCol).setValue(weekLabel_());
+        return;
+      }
     }
     Utilities.sleep(2000);
   }
@@ -277,6 +312,46 @@ function alertOversold_(lines, fresh) {
     'Two orders came in at almost the same time, so a day is slightly oversold:\n\n' +
     lines.join('\n') + '\n\nThe latest order was:\n' + latest.join('\n') +
     '\n\nYou may want to reach out to them. The form has already been updated.');
+}
+
+// ---------- Weekly schedule ----------
+
+function isClosed_(day) {
+  const cut = cutoffs_()[day];
+  return Boolean(cut) && Date.now() >= cut.getTime();
+}
+
+// This week's cutoff times: each is the first one after the week opened, in pickup-day order.
+function cutoffs_() {
+  let after = Number(PropertiesService.getScriptProperties().getProperty('weekStart') || Date.now());
+  const result = {};
+  for (const day of PICKUP.days) {
+    const cut = SCHEDULE.cutoffs[day];
+    if (!cut) continue;
+    result[day] = nextWeekdayAt_(after, cut.day, cut.hour);
+    after = result[day].getTime();
+  }
+  return result;
+}
+
+// The first moment after `after` (ms) that falls on `dayName` at `hour`:00, in the script's time zone.
+function nextWeekdayAt_(after, dayName, hour) {
+  const tz = Session.getScriptTimeZone();
+  const names = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY'];
+  for (let i = 0; i <= 8; i++) {
+    const date = new Date(after + i * 86400000);
+    if (names[Number(Utilities.formatDate(date, tz, 'u')) - 1] !== dayName) continue;
+    const when = Utilities.parseDate(`${Utilities.formatDate(date, tz, 'yyyy-MM-dd')} ${hour}:00`, tz, 'yyyy-MM-dd H:mm');
+    if (when.getTime() > after) return when;
+  }
+  throw new Error(`Couldn't work out the next ${dayName} at ${hour}:00.`);
+}
+
+// "Week of Nov 5", using the first pickup day's date
+function weekLabel_() {
+  const first = cutoffs_()[PICKUP.days[0]];
+  if (!first) return '';
+  return `Week of ${Utilities.formatDate(new Date(first.getTime() + 86400000), Session.getScriptTimeZone(), 'MMM d')}`;
 }
 
 // ---------- Small helpers ----------
