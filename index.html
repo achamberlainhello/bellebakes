@@ -35,6 +35,9 @@ main{max-width:1060px;margin:auto;padding:65px 22px}
 .details h3{font-size:26px;margin:0 0 6px}
 .details p{color:var(--muted);line-height:1.65;font-size:13px}
 .price{font-weight:700;margin:14px 0 0}
+.stock{margin-top:8px;font-size:12px;font-weight:600;color:var(--sage);min-height:1em}
+.stock.sold-out{color:#9d6b5b}
+.btn[aria-disabled="true"]{opacity:.5;pointer-events:none;cursor:not-allowed}
 .menu-cta{text-align:center;margin-top:30px}
 .menu-cta .btn{padding:16px 40px;font-size:14px;letter-spacing:.04em}
 /* How to order */
@@ -79,6 +82,7 @@ footer{text-align:center;border-top:1px solid var(--line);padding:28px;font-size
           <h3>Classic Sourdough</h3>
           <p>Our classic crusty, golden loaf. Naturally fermented, tender inside, and perfect for sharing.</p>
           <div class="price">$15 / loaf</div>
+          <div class="stock" id="sourdough-stock"></div>
         </div>
       </article>
       <article class="product">
@@ -87,11 +91,12 @@ footer{text-align:center;border-top:1px solid var(--line);padding:28px;font-size
           <h3>Oatmeal Chocolate Chip Cookies</h3>
           <p>Four soft-centered, chewy oatmeal cookies with plenty of chocolate chips. Our weekly classic, with seasonal specials from time to time!</p>
           <div class="price">$12 / bundle of 4</div>
+          <div class="stock" id="cookies-stock"></div>
         </div>
       </article>
     </div>
     <div class="menu-cta">
-      <a class="btn" href="https://docs.google.com/forms/d/e/1FAIpQLScSSouPBrOG35Gd4BskMDdnSMAsYQ6ADfHHWq83gf2lSv1_hA/viewform" target="_blank" rel="noopener noreferrer">Order here</a>
+      <a class="btn" id="order-button" href="https://docs.google.com/forms/d/e/1FAIpQLScSSouPBrOG35Gd4BskMDdnSMAsYQ6ADfHHWq83gf2lSv1_hA/viewform" target="_blank" rel="noopener noreferrer">Order here</a>
     </div>
   </section>
 
@@ -119,5 +124,46 @@ footer{text-align:center;border-top:1px solid var(--line);padding:28px;font-size
   <a class="btn" href="coaching.html">Explore life coaching</a>
 </section>
 <footer>© Belle Bakes · Homemade things for busy people ♡ · <span>Product photos are illustrative; actual bakes may vary. Photos via <a href="https://unsplash.com" target="_blank" rel="noopener">Unsplash</a>.</span></footer>
+
+<script>
+/* Live counts from the order script's web app (counts only, no order details).
+   If it can't be reached, the labels stay empty and the Order here button still works. */
+const STATUS_URL = "https://script.google.com/macros/s/AKfycbzJB_OISe8iAZ-uUjOwvJu0cnrCsVBOkAKkK2WRY01lqtdN-_2v4SU6Xs2KRAn4DGZToA/exec";
+const SINGULAR = { "loaves": "loaf", "cookie bundles": "cookie bundle" };
+
+function showStatus(status) {
+  for (const [key, item] of Object.entries(status.items)) {
+    const label = document.getElementById(key + "-stock");
+    if (!label) continue;
+    const soldOut = item.left <= 0;
+    label.textContent = status.closedForWeek ? "Orders closed · reopen Friday at 8pm"
+      : soldOut ? "Sold out this week"
+      : `${item.left} ${item.left === 1 ? SINGULAR[item.unit] || item.unit : item.unit} left this week`;
+    label.classList.toggle("sold-out", soldOut || status.closedForWeek);
+  }
+  const button = document.getElementById("order-button");
+  const closed = !status.open || Object.values(status.items).every(i => i.left <= 0);
+  if (closed) {
+    button.textContent = status.closedForWeek ? "Orders reopen Friday at 8pm" : "Sold out this week. Back Friday at 8pm!";
+    button.setAttribute("aria-disabled", "true");
+  } else {
+    button.textContent = "Order here";
+    button.removeAttribute("aria-disabled");
+  }
+}
+
+async function loadStatus() {
+  if (!STATUS_URL) return;
+  try {
+    const res = await fetch(STATUS_URL);
+    if (res.ok) showStatus(await res.json());
+  } catch {
+    // leave the page as it is
+  }
+}
+
+loadStatus();
+setInterval(loadStatus, 60000);
+</script>
 </body>
 </html>

@@ -12,6 +12,7 @@
  *     hides a pickup day once it's fully booked, and closes the form when everything is gone.
  *   - Orders for both pickup days close Wednesday at 8pm.
  *   - Every Friday at 8pm it starts a new week: all choices come back and the form reopens.
+ *   - Shares live "left this week" counts with the website (doGet), and nothing else.
  *
  * Setup (once): paste this file into an Apps Script project (script.google.com, or ⋮ → Apps Script in the form) and save.
  * Ideally Annabelle then runs "setup" from her own Google account (toolbar → choose setup → Run),
@@ -34,8 +35,8 @@ const FORM_ID = '1nszT6Q0ebBJlTx-gVUr2F9am2Ho5lT0yN5F6GVj_log';
 // Question titles must match the form exactly. The number in each choice
 // ("2 loaves", "3 bundles (12 cookies)") is what gets counted.
 const ITEMS = [
-  { title: 'Sourdough?', unit: 'loaves', perDay: { Thursday: 4, Friday: 4 } },
-  { title: 'How many cookies would you like?', unit: 'cookie bundles', perDay: { Thursday: 7, Friday: 8 } },
+  { key: 'sourdough', title: 'Sourdough?', unit: 'loaves', perDay: { Thursday: 4, Friday: 4 } },
+  { key: 'cookies', title: 'How many cookies would you like?', unit: 'cookie bundles', perDay: { Thursday: 7, Friday: 8 } },
 ];
 
 const PICKUP = {
@@ -114,17 +115,19 @@ function resetWeek() {
   props.deleteProperty('assigned');
   const form = form_();
   Logger.log(updateForm_(form, weekState_(form).used).join('\n'));   // restores every choice, reopens the form
+  clearStatusCache_();
 }
 
 // Runs at each cutoff so a pickup day comes off the form on time.
 function refresh() {
   const form = form_();
   Logger.log(updateForm_(form, weekState_(form).used).join('\n'));
+  clearStatusCache_();
 }
 
 function checkStatus() {
   const form = form_();
-  const { used } = weekState_(form);
+  const { used } = weekState_(form, true);
   for (const day of PICKUP.days) {
     for (const item of ITEMS) {
       Logger.log(`${day}  ${item.title}  ${used[day][item.title]} of ${item.perDay[day]} ${item.unit}`);
@@ -158,16 +161,55 @@ function onOrder() {
     // Orders that slipped in after Wednesday's cutoff, before the form had closed
     if (PICKUP.days.every(isClosed_)) fresh.forEach(f => alertLate_(f.order));
     updateForm_(form, used);
+    clearStatusCache_();
   } finally {
     lock.releaseLock();
   }
+}
+
+// ---------- Live counts for the website ----------
+
+// Published as a web app (Deploy → Web app, run as Annabelle, anyone can view). The website
+// reads it to show "5 loaves left" / "Sold out". It shares only counts, never order details.
+function doGet() {
+  const cache = CacheService.getScriptCache();
+  let json = cache.get('status');
+  if (!json) {
+    json = JSON.stringify(status_());
+    cache.put('status', json, 30);   // at most 30 seconds old; cleared after every order anyway
+  }
+  return ContentService.createTextOutput(json).setMimeType(ContentService.MimeType.JSON);
+}
+
+function status_() {
+  const form = form_();
+  const { used } = weekState_(form, true);
+  const items = {};
+  for (const item of ITEMS) {
+    const left = PICKUP.days
+      .filter(d => !isClosed_(d))
+      .reduce((sum, d) => sum + Math.max(0, item.perDay[d] - used[d][item.title]), 0);
+    items[item.key] = { left, unit: item.unit };
+  }
+  return {
+    open: form.isAcceptingResponses(),
+    closedForWeek: PICKUP.days.every(isClosed_),
+    items,
+    updated: new Date().toISOString(),
+  };
+}
+
+function clearStatusCache_() {
+  CacheService.getScriptCache().remove('status');
 }
 
 // ---------- Deciding pickup days ----------
 
 // Walks this week's orders in the order they arrived. Orders already given a day keep it;
 // new ones get a day now. Returns what's used per day, plus the newly assigned orders.
-function weekState_(form) {
+// readOnly: work out the counts without saving any new assignments (for the website and
+// checkStatus, so a brand-new order is still handled, emailed and recorded by onOrder).
+function weekState_(form, readOnly = false) {
   const props = PropertiesService.getScriptProperties();
   const assigned = JSON.parse(props.getProperty('assigned') || '{}');
   const since = new Date(Number(props.getProperty('weekStart') || 0));
@@ -186,7 +228,7 @@ function weekState_(form) {
     }
     ITEMS.forEach(i => { used[day][i.title] += order.qty[i.title]; });
   }
-  props.setProperty('assigned', JSON.stringify(assigned));
+  if (!readOnly) props.setProperty('assigned', JSON.stringify(assigned));
   return { used, fresh };
 }
 
