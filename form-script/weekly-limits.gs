@@ -26,6 +26,8 @@
  *   cookiesSoldOut() / sourdoughSoldOut() – stop selling that item for the rest of this week
  *                   (form and website show it sold out; it comes back when the new week opens)
  *   undoSoldOut()  – start selling anything marked sold out this week again
+ *   limitThisWeek() – use the totals in THIS_WEEK_TOTALS (below) for the rest of this week
+ *   undoLimitThisWeek() – go back to the usual limits for this week
  */
 
 // ---------- Settings ----------
@@ -41,6 +43,11 @@ const ITEMS = [
   { key: 'sourdough', title: 'Sourdough?', unit: 'loaves', perDay: { Thursday: 4, Friday: 4 } },
   { key: 'cookies', title: 'How many cookies would you like?', unit: 'cookie bundles', perDay: { Thursday: 7, Friday: 8 } },
 ];
+
+// One-week change to an item's total (e.g. fewer loaves prepped this week). Fill in, save, and run
+// limitThisWeek. It's split across the pickup days like the usual limits, already-placed orders
+// count toward it, and it ends when the new week opens. Example: { sourdough: 6 }
+const THIS_WEEK_TOTALS = { sourdough: 6 };
 
 const PICKUP = {
   title: 'When would you like to pick up?',
@@ -117,6 +124,7 @@ function resetWeek() {
   props.setProperty('weekStart', String(Date.now()));
   props.deleteProperty('assigned');
   props.deleteProperty('soldOut');
+  props.deleteProperty('limitsThisWeek');
   const form = form_();
   Logger.log(updateForm_(form, weekState_(form).used).join('\n'));   // restores every choice, reopens the form
   clearStatusCache_();
@@ -146,12 +154,26 @@ function markSoldOut_(key) {
   refresh();
 }
 
+// Fewer than usual this week: uses THIS_WEEK_TOTALS until the new week opens.
+function limitThisWeek() {
+  for (const key of Object.keys(THIS_WEEK_TOTALS)) {
+    if (!ITEMS.some(i => i.key === key)) throw new Error(`THIS_WEEK_TOTALS: no item called "${key}".`);
+  }
+  PropertiesService.getScriptProperties().setProperty('limitsThisWeek', JSON.stringify(THIS_WEEK_TOTALS));
+  refresh();
+}
+
+function undoLimitThisWeek() {
+  PropertiesService.getScriptProperties().deleteProperty('limitsThisWeek');
+  refresh();
+}
+
 function checkStatus() {
   const form = form_();
   const { used } = weekState_(form, true);
   for (const day of PICKUP.days) {
     for (const item of ITEMS) {
-      Logger.log(`${day}  ${item.title}  ${used[day][item.title]} of ${item.perDay[day]} ${item.unit}`);
+      Logger.log(`${day}  ${item.title}  ${used[day][item.title]} of ${perDay_(item, day)} ${item.unit}`);
     }
   }
   const soldOut = ITEMS.filter(i => soldOut_().includes(i.key)).map(i => i.title);
@@ -177,7 +199,7 @@ function onOrder() {
     const over = [];
     for (const day of PICKUP.days) {
       for (const item of ITEMS) {
-        if (used[day][item.title] > item.perDay[day]) over.push(`• ${day} ${item.title}: ${used[day][item.title]} ordered, limit ${item.perDay[day]} ${item.unit}`);
+        if (used[day][item.title] > perDay_(item, day)) over.push(`• ${day} ${item.title}: ${used[day][item.title]} ordered, limit ${perDay_(item, day)} ${item.unit}`);
       }
     }
     for (const { order } of fresh) {
@@ -261,13 +283,24 @@ function weekState_(form, readOnly = false) {
 function fits_(order, used, day) {
   const soldOut = soldOut_();
   return ITEMS.every(i => !(soldOut.includes(i.key) && order.qty[i.title] > 0) &&
-    used[day][i.title] + order.qty[i.title] <= i.perDay[day]);
+    used[day][i.title] + order.qty[i.title] <= perDay_(i, day));
 }
 
 // What a pickup day still has of an item: nothing once the day has closed or the item is marked sold out.
 function left_(item, day, used) {
   if (isClosed_(day) || soldOut_().includes(item.key)) return 0;
-  return Math.max(0, item.perDay[day] - used[day][item.title]);
+  return Math.max(0, perDay_(item, day) - used[day][item.title]);
+}
+
+// An item's limit for a pickup day: the usual one, or this week's total split the same way
+// (each day gets its usual share, rounded down; the last day gets the rest).
+function perDay_(item, day) {
+  const total = JSON.parse(PropertiesService.getScriptProperties().getProperty('limitsThisWeek') || '{}')[item.key];
+  if (total === undefined) return item.perDay[day];
+  const usual = PICKUP.days.reduce((sum, d) => sum + (item.perDay[d] || 0), 0);
+  const shares = PICKUP.days.map(d => Math.floor(total * (item.perDay[d] || 0) / usual));
+  shares[shares.length - 1] = total - shares.slice(0, -1).reduce((a, b) => a + b, 0);
+  return shares[PICKUP.days.indexOf(day)];
 }
 
 // Item keys marked sold out for the rest of this week (cleared when the new week opens).
@@ -313,7 +346,7 @@ function updateForm_(form, used) {
     const most = Math.max(...left);
     const fits = most > 0 ? (originals[item.title] || []).filter(v => quantity_(v) <= most) : [];
     setChoices_(findItem_(form, item.title), fits.length ? fits : [SOLD_OUT_CHOICE]);
-    PICKUP.days.forEach((d, n) => summary.push(`${d}  ${item.title}  ${left[n]} of ${item.perDay[d]} ${item.unit} left`));
+    PICKUP.days.forEach((d, n) => summary.push(`${d}  ${item.title}  ${left[n]} of ${perDay_(item, d)} ${item.unit} left`));
   }
 
   // Offer only the days that are still taking orders and have something left.
