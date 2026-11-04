@@ -10,7 +10,7 @@
  *     Sheet's "Confirmed pickup" column says so.
  *   - Trims the quantity choices so nobody can pick more than one day's batch has left,
  *     hides a pickup day once it's fully booked, and closes the form when everything is gone.
- *   - Orders for both pickup days close Wednesday at 8pm.
+ *   - Orders for both pickup days close Wednesday at 8am.
  *   - Every Friday at 8pm it starts a new week: all choices come back and the form reopens.
  *   - Shares live "left this week" counts with the website (doGet), and nothing else.
  *
@@ -42,7 +42,7 @@ const ITEMS = [
 const PICKUP = {
   title: 'When would you like to pick up?',
   days: ['Thursday', 'Friday'],
-  help: 'We bake half of each item for Thursday and half for Friday. Orders for both days close Wednesday at 8pm. ' +
+  help: 'We bake half of each item for Thursday and half for Friday. Orders for both days close Wednesday at 8am. ' +
         'If your whole order can’t be ready Thursday, ' +
         'we’ll move it to Friday and email you.',
 };
@@ -63,8 +63,8 @@ const CLOSED_FOR_WEEK_MESSAGE = 'Orders for this week are closed. New orders ope
 const SCHEDULE = {
   opens: { day: 'FRIDAY', hour: 20 },                 // Friday 8pm: next week's orders open
   cutoffs: {
-    Thursday: { day: 'WEDNESDAY', hour: 20 },         // Thursday pickup closes Wednesday 8pm
-    Friday: { day: 'WEDNESDAY', hour: 20 },           // Friday pickup also closes Wednesday 8pm
+    Thursday: { day: 'WEDNESDAY', hour: 8 },          // Thursday pickup closes Wednesday 8am
+    Friday: { day: 'WEDNESDAY', hour: 8 },            // Friday pickup also closes Wednesday 8am
   },
 };
 
@@ -94,7 +94,7 @@ function setup() {
   ScriptApp.newTrigger('onOrder').forForm(form).onFormSubmit().create();
   ScriptApp.newTrigger('resetWeek').timeBased()
     .onWeekDay(ScriptApp.WeekDay[SCHEDULE.opens.day]).atHour(SCHEDULE.opens.hour).create();
-  // One refresh per distinct cutoff time (both days can share Wednesday 8pm).
+  // One refresh per distinct cutoff time (both days can share Wednesday 8am).
   const cutoffTimes = new Set(Object.values(SCHEDULE.cutoffs).map(cut => `${cut.day} ${cut.hour}`));
   for (const time of cutoffTimes) {
     const [day, hour] = time.split(' ');
