@@ -23,6 +23,9 @@
  *   checkStatus() – see this week's counts by day (shown in the Execution log)
  *   saveChoices() – after editing the quantity choices in the form (e.g. adding "5 loaves"),
  *                   run this so the script remembers the new full list
+ *   cookiesSoldOut() / sourdoughSoldOut() – stop selling that item for the rest of this week
+ *                   (form and website show it sold out; it comes back when the new week opens)
+ *   undoSoldOut()  – start selling anything marked sold out this week again
  */
 
 // ---------- Settings ----------
@@ -113,6 +116,7 @@ function resetWeek() {
   const props = PropertiesService.getScriptProperties();
   props.setProperty('weekStart', String(Date.now()));
   props.deleteProperty('assigned');
+  props.deleteProperty('soldOut');
   const form = form_();
   Logger.log(updateForm_(form, weekState_(form).used).join('\n'));   // restores every choice, reopens the form
   clearStatusCache_();
@@ -125,6 +129,23 @@ function refresh() {
   clearStatusCache_();
 }
 
+// Sold out early: stops an item for the rest of this week, whatever is left.
+function cookiesSoldOut() { markSoldOut_('cookies'); }
+function sourdoughSoldOut() { markSoldOut_('sourdough'); }
+
+function undoSoldOut() {
+  PropertiesService.getScriptProperties().deleteProperty('soldOut');
+  refresh();
+}
+
+function markSoldOut_(key) {
+  const props = PropertiesService.getScriptProperties();
+  const soldOut = soldOut_();
+  if (!soldOut.includes(key)) soldOut.push(key);
+  props.setProperty('soldOut', JSON.stringify(soldOut));
+  refresh();
+}
+
 function checkStatus() {
   const form = form_();
   const { used } = weekState_(form, true);
@@ -133,6 +154,8 @@ function checkStatus() {
       Logger.log(`${day}  ${item.title}  ${used[day][item.title]} of ${item.perDay[day]} ${item.unit}`);
     }
   }
+  const soldOut = ITEMS.filter(i => soldOut_().includes(i.key)).map(i => i.title);
+  if (soldOut.length) Logger.log(`Marked sold out this week: ${soldOut.join(', ')}`);
   for (const [day, when] of Object.entries(cutoffs_())) {
     Logger.log(`${day} pickup orders close ${when}`);
   }
@@ -155,6 +178,11 @@ function onOrder() {
     for (const day of PICKUP.days) {
       for (const item of ITEMS) {
         if (used[day][item.title] > item.perDay[day]) over.push(`• ${day} ${item.title}: ${used[day][item.title]} ordered, limit ${item.perDay[day]} ${item.unit}`);
+      }
+    }
+    for (const { order } of fresh) {
+      for (const item of ITEMS) {
+        if (soldOut_().includes(item.key) && order.qty[item.title] > 0) over.push(`• ${item.title}: ${order.qty[item.title]} ordered after it was marked sold out`);
       }
     }
     if (over.length) alertOversold_(over, fresh);
@@ -186,9 +214,7 @@ function status_() {
   const { used } = weekState_(form, true);
   const items = {};
   for (const item of ITEMS) {
-    const left = PICKUP.days
-      .filter(d => !isClosed_(d))
-      .reduce((sum, d) => sum + Math.max(0, item.perDay[d] - used[d][item.title]), 0);
+    const left = PICKUP.days.reduce((sum, d) => sum + left_(item, d, used), 0);
     items[item.key] = { left, unit: item.unit };
   }
   return {
@@ -233,7 +259,20 @@ function weekState_(form, readOnly = false) {
 }
 
 function fits_(order, used, day) {
-  return ITEMS.every(i => used[day][i.title] + order.qty[i.title] <= i.perDay[day]);
+  const soldOut = soldOut_();
+  return ITEMS.every(i => !(soldOut.includes(i.key) && order.qty[i.title] > 0) &&
+    used[day][i.title] + order.qty[i.title] <= i.perDay[day]);
+}
+
+// What a pickup day still has of an item: nothing once the day has closed or the item is marked sold out.
+function left_(item, day, used) {
+  if (isClosed_(day) || soldOut_().includes(item.key)) return 0;
+  return Math.max(0, item.perDay[day] - used[day][item.title]);
+}
+
+// Item keys marked sold out for the rest of this week (cleared when the new week opens).
+function soldOut_() {
+  return JSON.parse(PropertiesService.getScriptProperties().getProperty('soldOut') || '[]');
 }
 
 // The chosen day if it's still taking orders and the whole order fits; otherwise another open
@@ -270,8 +309,9 @@ function updateForm_(form, used) {
 
   // A single order goes to one day, so it can't be bigger than the most any open day has left.
   for (const item of ITEMS) {
-    const left = PICKUP.days.map(d => isClosed_(d) ? 0 : Math.max(0, item.perDay[d] - used[d][item.title]));
-    const fits = (originals[item.title] || []).filter(v => quantity_(v) <= Math.max(...left));
+    const left = PICKUP.days.map(d => left_(item, d, used));
+    const most = Math.max(...left);
+    const fits = most > 0 ? (originals[item.title] || []).filter(v => quantity_(v) <= most) : [];
     setChoices_(findItem_(form, item.title), fits.length ? fits : [SOLD_OUT_CHOICE]);
     PICKUP.days.forEach((d, n) => summary.push(`${d}  ${item.title}  ${left[n]} of ${item.perDay[d]} ${item.unit} left`));
   }
@@ -279,7 +319,7 @@ function updateForm_(form, used) {
   // Offer only the days that are still taking orders and have something left.
   const stillOpen = PICKUP.days.filter(d => !isClosed_(d));
   const open = (originals[PICKUP.title] || PICKUP.days)
-    .filter(d => stillOpen.includes(d) && ITEMS.some(i => i.perDay[d] !== undefined && used[d][i.title] < i.perDay[d]));
+    .filter(d => stillOpen.includes(d) && ITEMS.some(i => i.perDay[d] !== undefined && left_(i, d, used) > 0));
   if (open.length) setChoices_(findItem_(form, PICKUP.title), open);
 
   form.setCustomClosedFormMessage(stillOpen.length ? CLOSED_MESSAGE : CLOSED_FOR_WEEK_MESSAGE);
@@ -356,7 +396,7 @@ function alertOversold_(lines, fresh) {
   const to = ALERT_EMAIL || Session.getEffectiveUser().getEmail();
   const latest = fresh.length ? fresh[fresh.length - 1].order.summary : [];
   MailApp.sendEmail(to, `${SHOP_NAME}: an order went over a day’s limit`,
-    'Two orders came in at almost the same time, so a day is slightly oversold:\n\n' +
+    'An order came in just after something ran out, so a day is slightly oversold:\n\n' +
     lines.join('\n') + '\n\nThe latest order was:\n' + latest.join('\n') +
     '\n\nYou may want to reach out to them. The form has already been updated.');
 }
