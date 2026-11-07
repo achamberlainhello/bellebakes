@@ -12,6 +12,8 @@
  *     hides a pickup day once it's fully booked, and closes the form when everything is gone.
  *   - Orders for both pickup days close Wednesday at 8am.
  *   - Every Friday at 8pm it starts a new week: all choices come back and the form reopens.
+ *   - Holiday pre-orders (HOLIDAY below) have their own count per date and stay open, even while
+ *     the weekly menu is sold out or closed, until each date's pre-orders close.
  *   - Shares live "left this week" counts with the website (doGet), and nothing else.
  *
  * Setup (once): paste this file into an Apps Script project (script.google.com, or ⋮ → Apps Script in the form) and save.
@@ -40,14 +42,14 @@ const FORM_ID = '1nszT6Q0ebBJlTx-gVUr2F9am2Ho5lT0yN5F6GVj_log';
 // Question titles must match the form exactly. The number in each choice
 // ("2 loaves", "3 bundles (12 cookies)") is what gets counted.
 const ITEMS = [
-  { key: 'sourdough', title: 'Sourdough?', unit: 'loaves', perDay: { Thursday: 4, Friday: 4 } },
-  { key: 'cookies', title: 'How many cookies would you like?', unit: 'cookie bundles', perDay: { Thursday: 7, Friday: 8 } },
+  { key: 'sourdough', title: 'Sourdough?', unit: 'loaves', perDay: { Thursday: 3, Friday: 3 } },
+  { key: 'cookies', title: 'How many cookies would you like?', unit: 'cookie bundles', perDay: { Thursday: 5, Friday: 5 } },
 ];
 
 // One-week change to an item's total (e.g. fewer loaves prepped this week). Fill in, save, and run
 // limitThisWeek. It's split across the pickup days like the usual limits, already-placed orders
-// count toward it, and it ends when the new week opens. Example: { sourdough: 6 }
-const THIS_WEEK_TOTALS = { sourdough: 6 };
+// count toward it, and it ends when the new week opens. Example: { sourdough: 4 }
+const THIS_WEEK_TOTALS = {};
 
 const PICKUP = {
   title: 'When would you like to pick up?',
@@ -57,13 +59,35 @@ const PICKUP = {
         'we’ll move it to Friday and email you.',
 };
 
+// Holiday pre-orders: a set number of bundles for each date, counted across every week (they don't
+// reset on Fridays). setup() adds the questions to the form after the pickup question. Each date stops
+// taking pre-orders at `closes` (script time zone). Once the season is over, the questions can be
+// deleted from the form; the script carries on without them.
+const HOLIDAY = {
+  header: 'Holiday pre-orders',
+  help: 'Chocolate peppermint cookies, $15 for a bundle of 4. Pre-orders for December 4 close Monday, ' +
+        'November 30 at 10am, and for December 11, Monday, December 7 at 10am.',
+  choices: ['1 bundle (4 cookies)', '2 bundles (8 cookies)', '3 bundles (12 cookies)'],
+  unit: 'bundles',
+  onlyChoice: 'Holiday pre-order only',   // pickup choice for an order with nothing from this week's menu
+  pickupHelp: 'Holiday pre-orders are picked up on their date, so if that’s all you’re ordering, choose “Holiday pre-order only.”',
+  dates: [
+    { key: 'dec4', title: 'Chocolate peppermint cookies for Friday, December 4', pickup: 'Holiday: Friday, Dec 4', total: 10, closes: '2026-11-30 10:00' },
+    { key: 'dec11', title: 'Chocolate peppermint cookies for Friday, December 11', pickup: 'Holiday: Friday, Dec 11', total: 10, closes: '2026-12-07 10:00' },
+  ],
+};
+
 const NAME_TITLE = 'Name (first & last)';
 const EMAIL_TITLE = 'Email';
 const PICKUP_COLUMN = 'Confirmed pickup';   // added to the order Sheet
 const WEEK_COLUMN = 'Week';                 // e.g. "Week of Nov 5", for filtering the Sheet
 
 const SHOP_NAME = 'Belle Bakes';
+// Stand-in choices when nothing can be ordered. No numbers in these: the number in a choice is what's counted.
 const SOLD_OUT_CHOICE = 'Sold out this week';
+const CLOSED_CHOICE = 'Orders reopen Friday evening';    // weekly menu, while orders are closed but holiday pre-orders aren't
+const HOLIDAY_SOLD_OUT_CHOICE = 'Sold out';
+const HOLIDAY_CLOSED_CHOICE = 'Pre-orders closed';
 const CLOSED_MESSAGE = 'We’re sold out this week! Thank you so much ♡ Check back soon for next week’s bakes.';
 
 const CLOSED_FOR_WEEK_MESSAGE = 'Orders for this week are closed. New orders open Friday at 8pm ♡';
@@ -93,11 +117,13 @@ function setup() {
   if (!props.getProperty('originals')) {
     const originals = {};
     for (const title of ITEMS.map(i => i.title).concat(PICKUP.title)) {
-      originals[title] = choiceValues_(findItem_(form, title)).filter(v => v !== SOLD_OUT_CHOICE);
+      originals[title] = choiceValues_(findItem_(form, title))
+        .filter(v => ![SOLD_OUT_CHOICE, CLOSED_CHOICE, HOLIDAY.onlyChoice].includes(v));
     }
     props.setProperty('originals', JSON.stringify(originals));
   }
   if (!props.getProperty('weekStart')) props.setProperty('weekStart', String(Date.now()));
+  ensureHolidayQuestions_(form);
 
   // Replace any earlier triggers from this script, then add the two it needs.
   ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
@@ -109,6 +135,10 @@ function setup() {
   for (const time of cutoffTimes) {
     const [day, hour] = time.split(' ');
     ScriptApp.newTrigger('refresh').timeBased().onWeekDay(ScriptApp.WeekDay[day]).atHour(Number(hour)).create();
+  }
+  // And one when each holiday date's pre-orders close.
+  for (const h of HOLIDAY.dates) {
+    if (!holidayClosed_(h)) ScriptApp.newTrigger('refresh').timeBased().at(closesAt_(h)).create();
   }
 
   Logger.log(updateForm_(form, weekState_(form).used).join('\n'));
@@ -178,6 +208,10 @@ function checkStatus() {
   }
   const soldOut = ITEMS.filter(i => soldOut_().includes(i.key)).map(i => i.title);
   if (soldOut.length) Logger.log(`Marked sold out this week: ${soldOut.join(', ')}`);
+  const holidayUsed = holidayUsed_(form);
+  for (const h of HOLIDAY.dates) {
+    Logger.log(`${h.title}  ${holidayUsed[h.title]} of ${h.total} ${HOLIDAY.unit} (pre-orders close ${closesAt_(h)})`);
+  }
   for (const [day, when] of Object.entries(cutoffs_())) {
     Logger.log(`${day} pickup orders close ${when}`);
   }
@@ -206,10 +240,20 @@ function onOrder() {
       for (const item of ITEMS) {
         if (soldOut_().includes(item.key) && order.qty[item.title] > 0) over.push(`• ${item.title}: ${order.qty[item.title]} ordered after it was marked sold out`);
       }
+      for (const h of HOLIDAY.dates) {
+        if (holidayClosed_(h) && order.holiday[h.title] > 0) over.push(`• ${h.title}: ${order.holiday[h.title]} ordered after pre-orders closed`);
+      }
+    }
+    // Holiday counts never reset, so only mention one when a new order adds to it.
+    const holidayUsed = holidayUsed_(form);
+    for (const h of HOLIDAY.dates) {
+      if (holidayUsed[h.title] > h.total && fresh.some(f => f.order.holiday[h.title] > 0)) {
+        over.push(`• ${h.title}: ${holidayUsed[h.title]} ordered, limit ${h.total} ${HOLIDAY.unit}`);
+      }
     }
     if (over.length) alertOversold_(over, fresh);
-    // Orders that slipped in after Wednesday's cutoff, before the form had closed
-    if (PICKUP.days.every(isClosed_)) fresh.forEach(f => alertLate_(f.order));
+    // Orders from this week's menu that slipped in after Wednesday's cutoff, before the form had closed
+    if (PICKUP.days.every(isClosed_)) fresh.filter(f => hasWeekly_(f.order)).forEach(f => alertLate_(f.order));
     updateForm_(form, used);
     clearStatusCache_();
   } finally {
@@ -239,10 +283,14 @@ function status_() {
     const left = PICKUP.days.reduce((sum, d) => sum + left_(item, d, used), 0);
     items[item.key] = { left, unit: item.unit };
   }
+  const holidayUsed = holidayUsed_(form);
+  const holiday = {};
+  for (const h of HOLIDAY.dates) holiday[h.key] = { left: holidayLeft_(h, holidayUsed), closed: holidayClosed_(h) };
   return {
     open: form.isAcceptingResponses(),
     closedForWeek: PICKUP.days.every(isClosed_),
     items,
+    holiday,
     updated: new Date().toISOString(),
   };
 }
@@ -320,18 +368,24 @@ function chooseDay_(order, used) {
 }
 
 function readOrder_(response) {
-  const order = { qty: {}, preferred: '', name: '', email: '', summary: [] };
+  const order = { qty: {}, holiday: {}, preferred: '', name: '', email: '', summary: [] };
   ITEMS.forEach(i => { order.qty[i.title] = 0; });
+  HOLIDAY.dates.forEach(h => { order.holiday[h.title] = 0; });
   for (const answer of response.getItemResponses()) {
     const title = answer.getItem().getTitle().trim();
     const values = [].concat(answer.getResponse());
     order.summary.push(`${title}: ${values.join(', ')}`);
     if (title in order.qty) order.qty[title] = values.reduce((sum, v) => sum + quantity_(v), 0);
-    else if (title === PICKUP.title) order.preferred = String(values[0]);
+    else if (title in order.holiday) order.holiday[title] = values.reduce((sum, v) => sum + quantity_(v), 0);
+    else if (title === PICKUP.title) order.preferred = String(values[0]) === HOLIDAY.onlyChoice ? '' : String(values[0]);
     else if (title === NAME_TITLE) order.name = String(values[0]).trim();
     else if (title === EMAIL_TITLE) order.email = String(values[0]).trim();
   }
   return order;
+}
+
+function hasWeekly_(order) {
+  return ITEMS.some(i => order.qty[i.title] > 0);
 }
 
 // ---------- Updating the form ----------
@@ -339,26 +393,56 @@ function readOrder_(response) {
 function updateForm_(form, used) {
   const originals = JSON.parse(PropertiesService.getScriptProperties().getProperty('originals') || '{}');
   const summary = [];
+  const stillOpen = PICKUP.days.filter(d => !isClosed_(d));
 
   // A single order goes to one day, so it can't be bigger than the most any open day has left.
   for (const item of ITEMS) {
     const left = PICKUP.days.map(d => left_(item, d, used));
     const most = Math.max(...left);
     const fits = most > 0 ? (originals[item.title] || []).filter(v => quantity_(v) <= most) : [];
-    setChoices_(findItem_(form, item.title), fits.length ? fits : [SOLD_OUT_CHOICE]);
+    setChoices_(findItem_(form, item.title), fits.length ? fits : [stillOpen.length ? SOLD_OUT_CHOICE : CLOSED_CHOICE]);
     PICKUP.days.forEach((d, n) => summary.push(`${d}  ${item.title}  ${left[n]} of ${perDay_(item, d)} ${item.unit} left`));
   }
 
-  // Offer only the days that are still taking orders and have something left.
-  const stillOpen = PICKUP.days.filter(d => !isClosed_(d));
+  // Holiday pre-orders: each date offers only what it has left, until its pre-orders close.
+  const holidayUsed = holidayUsed_(form);
+  const holidayOpen = [];
+  for (const h of HOLIDAY.dates) {
+    const question = holidayItem_(form, h);
+    if (!question) continue;
+    const left = holidayLeft_(h, holidayUsed);
+    const fits = HOLIDAY.choices.filter(v => quantity_(v) <= left);
+    setChoices_(question, fits.length ? fits : [holidayClosed_(h) ? HOLIDAY_CLOSED_CHOICE : HOLIDAY_SOLD_OUT_CHOICE]);
+    if (fits.length) holidayOpen.push(h);
+    summary.push(`${h.title}  ${left} of ${h.total} ${HOLIDAY.unit} left${holidayClosed_(h) ? ' (pre-orders closed)' : ''}`);
+  }
+
+  // Offer only the days that are still taking orders and have something left, plus
+  // "Holiday pre-order only" while there are holiday pre-orders to be had.
   const open = (originals[PICKUP.title] || PICKUP.days)
     .filter(d => stillOpen.includes(d) && ITEMS.some(i => i.perDay[d] !== undefined && left_(i, d, used) > 0));
-  if (open.length) setChoices_(findItem_(form, PICKUP.title), open);
+  const pickup = open.concat(holidayOpen.length ? [HOLIDAY.onlyChoice] : []);
+  const pickupQuestion = findItem_(form, PICKUP.title);
+  if (pickup.length) setChoices_(pickupQuestion, pickup);
+  const help = PICKUP.help + (holidayOpen.length ? ' ' + HOLIDAY.pickupHelp : '');
+  if (pickupQuestion.getHelpText() !== help) pickupQuestion.setHelpText(help);
 
-  form.setCustomClosedFormMessage(stillOpen.length ? CLOSED_MESSAGE : CLOSED_FOR_WEEK_MESSAGE);
-  form.setAcceptingResponses(open.length > 0);
-  summary.push(`Form is ${open.length ? 'open' : stillOpen.length ? 'closed (sold out)' : 'closed until the new week opens'}.`);
+  // Forms can refuse to change the closed message while the form is closed, so it's changed
+  // while the form is open, and a refused message never stops the form opening or closing.
+  if (pickup.length) form.setAcceptingResponses(true);
+  setClosedMessage_(form, stillOpen.length ? CLOSED_MESSAGE : CLOSED_FOR_WEEK_MESSAGE);
+  if (!pickup.length) form.setAcceptingResponses(false);
+  summary.push(`Form is ${open.length ? 'open' : pickup.length ? 'open for holiday pre-orders only'
+    : stillOpen.length ? 'closed (sold out)' : 'closed until the new week opens'}.`);
   return summary;
+}
+
+function setClosedMessage_(form, message) {
+  try {
+    if (form.getCustomClosedFormMessage() !== message) form.setCustomClosedFormMessage(message);
+  } catch (err) {
+    Logger.log('Closed-form message not changed: ' + err);
+  }
 }
 
 function ensurePickupQuestion_(form) {
@@ -374,6 +458,27 @@ function ensurePickupQuestion_(form) {
   form.moveItem(question.getIndex(), after + 1);
 }
 
+// Adds the holiday heading and a question per date (still taking pre-orders) right after the pickup question.
+function ensureHolidayQuestions_(form) {
+  if (HOLIDAY.dates.every(holidayClosed_)) return;
+  const find = title => form.getItems().find(i => i.getTitle().trim() === title);
+  let header = find(HOLIDAY.header);
+  if (!header) {
+    header = form.addSectionHeaderItem().setTitle(HOLIDAY.header);
+    form.moveItem(header.getIndex(), findItem_(form, PICKUP.title).getIndex() + 1);
+  }
+  header.setHelpText(HOLIDAY.help);
+  let after = header.getIndex();
+  for (const h of HOLIDAY.dates) {
+    let question = find(h.title);
+    if (!question && !holidayClosed_(h)) {
+      question = form.addMultipleChoiceItem().setTitle(h.title).setChoiceValues(HOLIDAY.choices).setRequired(false);
+      form.moveItem(question.getIndex(), after + 1);
+    }
+    if (question) after = question.getIndex();
+  }
+}
+
 // ---------- Order Sheet and emails ----------
 
 // Writes the confirmed day next to the order in the linked response Sheet, if there is one.
@@ -381,7 +486,9 @@ function recordPickup_(form, response, order, day) {
   if (form.getDestinationType() !== FormApp.DestinationType.SPREADSHEET) return;
   const book = SpreadsheetApp.openById(form.getDestinationId());
   const sheet = book.getSheets().find(s => s.getFormUrl()) || book.getSheets()[0];
-  const note = day + (order.preferred && day !== order.preferred ? ` (moved from ${order.preferred})` : '');
+  const holiday = HOLIDAY.dates.filter(h => order.holiday[h.title] > 0).map(h => h.pickup);
+  const weekly = day + (order.preferred && day !== order.preferred ? ` (moved from ${order.preferred})` : '');
+  const note = (hasWeekly_(order) || !holiday.length ? [weekly] : []).concat(holiday).join(' + ');
   const when = response.getTimestamp().getTime();
 
   for (let attempt = 0; attempt < 3; attempt++) {   // the new row can take a moment to appear
@@ -476,6 +583,37 @@ function nextWeekdayAt_(after, dayName, hour) {
     if (when.getTime() > after) return when;
   }
   throw new Error(`Couldn't work out the next ${dayName} at ${hour}:00.`);
+}
+
+// ---------- Holiday pre-orders ----------
+
+function closesAt_(h) {
+  return Utilities.parseDate(h.closes, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+}
+
+function holidayClosed_(h) {
+  return Date.now() >= closesAt_(h).getTime();
+}
+
+function holidayItem_(form, h) {
+  return form.getItems().find(i => i.getTitle().trim() === h.title);
+}
+
+// Bundles pre-ordered for each date so far, across every week.
+function holidayUsed_(form) {
+  const used = {};
+  HOLIDAY.dates.forEach(h => { used[h.title] = 0; });
+  for (const response of form.getResponses()) {
+    for (const answer of response.getItemResponses()) {
+      const title = answer.getItem().getTitle().trim();
+      if (title in used) used[title] += [].concat(answer.getResponse()).reduce((sum, v) => sum + quantity_(v), 0);
+    }
+  }
+  return used;
+}
+
+function holidayLeft_(h, used) {
+  return holidayClosed_(h) ? 0 : Math.max(0, h.total - used[h.title]);
 }
 
 // "Week of Nov 5", using the first pickup day's date

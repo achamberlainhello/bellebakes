@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-:root{--ink:#45362f;--muted:#817168;--cream:#fbf8f2;--paper:#fffefa;--sage:#7c8874;--blush:#f3e7df;--line:#e7ded5}
+:root{--ink:#45362f;--muted:#817168;--cream:#fbf8f2;--paper:#fffefa;--sage:#7c8874;--blush:#f3e7df;--line:#e7ded5;--berry:#a3443c}
 *{box-sizing:border-box}
 body{margin:0;background:var(--cream);color:var(--ink);font-family:"DM Sans",sans-serif}
 h1,h2,h3,.serif{font-family:"Playfair Display",serif;font-weight:500}
@@ -52,10 +52,26 @@ main{max-width:1060px;margin:auto;padding:65px 22px}
 .about h2{font-size:38px}
 .about p{line-height:1.9;color:var(--muted)}
 footer{text-align:center;border-top:1px solid var(--line);padding:28px;font-size:12px;color:var(--muted)}
+/* Holiday pre-orders */
+.holiday-bar{display:block;background:var(--berry);color:#fff;text-align:center;padding:11px 16px;font-size:13px;letter-spacing:.06em;text-decoration:none;font-weight:600}
+.holiday-bar span{text-decoration:underline;text-underline-offset:3px;font-weight:500;margin-left:6px}
+.holiday{margin-top:65px}
+.holiday .eyebrow{color:var(--berry)}
+.holiday-card{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);background:var(--paper);border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.holiday-card .art{height:auto;min-height:340px;background:repeating-linear-gradient(135deg,#f6ebe6 0 22px,#fbf5f1 22px 44px)}
+.holiday-card .details{padding:34px;display:flex;flex-direction:column;justify-content:center}
+.holiday-card h3{font-size:30px}
+.dates{list-style:none;padding:0;margin:16px 0 0;font-size:13px;line-height:1.7;color:#65594e}
+.dates li{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;padding:8px 0;border-top:1px solid var(--line)}
+.dates strong{color:var(--ink);font-weight:600}
+.dates .stock{margin:0}
+.holiday-card .btn{align-self:flex-start;margin-top:22px;background:var(--berry)}
+@media(max-width:650px){.holiday{margin-top:45px}.holiday-card{grid-template-columns:1fr}.holiday-card .art{min-height:0;height:260px}.holiday-card .details{padding:24px}}
 @media(max-width:650px){nav{gap:10px}.products,.steps{grid-template-columns:1fr}.hero{padding:70px 20px}.art{height:190px}.order{padding:20px}.section-head h2{font-size:34px}}
 </style>
 </head>
 <body>
+<a class="holiday-bar" href="#holiday">Pre-order for the holidays now! <span>Chocolate peppermint cookies</span></a>
 <header>
   <div class="brand">belle bakes <span style="font-size:15px">✿</span></div>
   <nav><a href="#menu">This week's menu</a><a href="#about">Our story</a><a href="coaching.html">Life coaching</a></nav>
@@ -67,6 +83,7 @@ footer{text-align:center;border-top:1px solid var(--line);padding:28px;font-size
   <p>There's nothing quite like homemade cookies &amp; fresh sourdough.</p>
   <a class="btn" href="#menu">Shop this week's menu</a>
 </section>
+
 
 <main>
   <section id="menu">
@@ -98,6 +115,27 @@ footer{text-align:center;border-top:1px solid var(--line);padding:28px;font-size
     <div class="menu-cta">
       <a class="btn" id="order-button" href="https://docs.google.com/forms/d/e/1FAIpQLScSSouPBrOG35Gd4BskMDdnSMAsYQ6ADfHHWq83gf2lSv1_hA/viewform" target="_blank" rel="noopener noreferrer">Order here</a>
     </div>
+  </section>
+
+  <section class="holiday" id="holiday">
+    <div class="section-head">
+      <div class="eyebrow">Holiday special</div>
+      <h2>Pre-order for the holidays now!</h2>
+      <p>A limited holiday bake, picked up Friday, December 4 or Friday, December 11.</p>
+    </div>
+    <article class="holiday-card">
+      <div class="art"><img src="images/chocolate-peppermint-cookies.jpg" alt="A stack of chocolate peppermint cookies with melty chocolate and crushed candy cane" loading="lazy"></div>
+      <div class="details">
+        <h3>Chocolate Peppermint Cookies</h3>
+        <p>Rich, fudgy chocolate cookies packed with melty chocolate and crushed candy cane. Perfect for holiday parties, cookie swaps, and gifting.</p>
+        <div class="price">$15 / bundle of 4</div>
+        <ul class="dates">
+          <li><strong>Friday, December 4</strong> pre-order by Mon, Nov 30 at 10am <span class="stock" id="dec4-stock"></span></li>
+          <li><strong>Friday, December 11</strong> pre-order by Mon, Dec 7 at 10am <span class="stock" id="dec11-stock"></span></li>
+        </ul>
+        <a class="btn" id="holiday-button" href="https://docs.google.com/forms/d/e/1FAIpQLScSSouPBrOG35Gd4BskMDdnSMAsYQ6ADfHHWq83gf2lSv1_hA/viewform" target="_blank" rel="noopener noreferrer">Pre-order here</a>
+      </div>
+    </article>
   </section>
 
   <section class="order" id="order">
@@ -141,8 +179,22 @@ function showStatus(status) {
       : `${item.left} ${item.left === 1 ? SINGULAR[item.unit] || item.unit : item.unit} left this week`;
     label.classList.toggle("sold-out", soldOut || status.closedForWeek);
   }
+  for (const [key, date] of Object.entries(status.holiday || {})) {
+    const label = document.getElementById(key + "-stock");
+    if (!label) continue;
+    label.textContent = date.closed ? "Pre-orders closed" : date.left <= 0 ? "Sold out"
+      : `${date.left} ${date.left === 1 ? "bundle" : "bundles"} left`;
+    label.classList.toggle("sold-out", date.closed || date.left <= 0);
+  }
+  const holidayButton = document.getElementById("holiday-button");
+  const holidayOpen = status.open && Object.values(status.holiday || {}).some(d => !d.closed && d.left > 0);
+  holidayButton.textContent = holidayOpen ? "Pre-order here"
+    : Object.values(status.holiday || {}).every(d => d.closed) ? "Holiday pre-orders are closed" : "Holiday pre-orders are sold out";
+  holidayButton.toggleAttribute("aria-disabled", !holidayOpen);
+
+  // The form can stay open for holiday pre-orders after this week's menu is gone.
   const button = document.getElementById("order-button");
-  const closed = !status.open || Object.values(status.items).every(i => i.left <= 0);
+  const closed = !status.open || status.closedForWeek || Object.values(status.items).every(i => i.left <= 0);
   if (closed) {
     button.textContent = status.closedForWeek ? "Orders reopen Friday at 8pm" : "Sold out this week. Back Friday at 8pm!";
     button.setAttribute("aria-disabled", "true");
